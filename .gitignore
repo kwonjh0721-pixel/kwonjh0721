@@ -6,3 +6,5 @@ outputs*/
 __pycache__/
 .pytest_cache/
 *.pyc
+submissions/
+val_pred*.csv
