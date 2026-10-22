@@ -1,0 +1,8 @@
+data/*
+!data/sites.csv
+!data/smp.csv
+outputs*/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
