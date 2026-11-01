@@ -17,6 +17,8 @@ import sys
 import numpy as np
 import pandas as pd
 
+import model_backends as backends
+
 TZ = "Asia/Seoul"
 SITE_COUNT = 253
 SCORE_HOURS = 8760
@@ -225,6 +227,9 @@ class Config:
     chunk_hours: int = 168
     search_steps: int = 3000
     min_complete_hours: int = 168
+    model: str = "lightgbm"
+    learning_rate: float = .04
+    max_depth: int = 6
 
 
 def training_matrix(gen, sites, weather, prices, start, end):
@@ -252,22 +257,7 @@ def training_matrix(gen, sites, weather, prices, start, end):
 
 
 def fit_model(train, config, *, rounds=None, validation=None):
-    import lightgbm as lgb
-    x, y, w, _ = train
-    model = lgb.LGBMRegressor(
-        objective="regression_l1", n_estimators=rounds or config.trees,
-        learning_rate=.04, num_leaves=config.num_leaves,
-        min_child_samples=config.min_child_samples,
-        colsample_bytree=.9, subsample=.85, subsample_freq=1,
-        reg_lambda=2, max_bin=127, random_state=config.seed,
-        n_jobs=config.threads, deterministic=True, force_col_wise=True, verbosity=-1)
-    kwargs = {}
-    if validation is not None:
-        vx, vy, vw, _ = validation
-        kwargs.update(eval_set=[(vx, vy)], eval_sample_weight=[vw], eval_metric="l1",
-                      callbacks=[lgb.early_stopping(config.early_stopping, verbose=False)])
-    model.fit(x, y, sample_weight=w, categorical_feature=["site_code"], **kwargs)
-    return model
+    return backends.fit_model(train, config, rounds=rounds, validation=validation)
 
 
 def predict_sites(model, sites, weather, times, chunk_hours):
@@ -408,9 +398,112 @@ def fingerprint(path):
     return {"bytes": Path(path).stat().st_size, "sha256": digest.hexdigest()}
 
 
+def evaluate_saved(root, output):
+    """Re-score saved out-of-sample predictions; no model or test forecasts needed."""
+    root, output = Path(root), Path(output)
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    for name in ["sites.csv", "train/smp.csv", "train/generation.parquet"]:
+        require(fingerprint(root / name) == manifest["input_files"][name],
+                f"Input changed since training: {name}")
+    warnings = []
+    artifacts = manifest.get("holdout_artifacts")
+    if artifacts is None:
+        warnings.append("Older run: saved prediction/composition fingerprints are unavailable; provenance is not verified.")
+    else:
+        for name in ["composition.csv", "holdout_site_predictions.parquet"]:
+            require(fingerprint(output / name) == artifacts[name], f"Saved holdout artifact changed: {name}")
+
+    sites = read_sites(root)
+    first = stamp(manifest["config"]["holdout_from"]) + pd.Timedelta(hours=1)
+    last = stamp(manifest["final_cutoff"])
+    require(first <= last < stamp(manifest["test_start"]), "Invalid saved holdout interval")
+    times = pd.date_range(first, last, freq="h")
+    prices = read_prices(root / "train/smp.csv")
+    prices = prices[prices.ts.between(first, last)].reset_index(drop=True)
+    require(pd.DatetimeIndex(prices.ts).equals(times), "Holdout SMP has gaps")
+
+    composition = pd.read_csv(output / "composition.csv")
+    require(list(composition.columns) == ["site_id", "group"], "Wrong composition columns")
+    unique(composition, ["site_id"], "composition")
+    require(set(composition.site_id) == set(sites.site_id), "Site omission or unknown site")
+    require(composition.group.isin(["G1", "G2"]).all(), "Invalid group label")
+    groups = (composition.set_index("site_id").reindex(sites.site_id).group == "G2").to_numpy(np.int8)
+    capacities = validate_groups(sites, groups)
+
+    pred = pd.read_parquet(output / "holdout_site_predictions.parquet")
+    require(set(pred.columns) == {"site_id", "ts", "forecast_kwh"}, "Wrong holdout prediction columns")
+    pred["ts"] = timestamps(pred.ts, aware=True)
+    unique(pred, ["site_id", "ts"], "holdout predictions")
+    require(set(pred.site_id) == set(sites.site_id), "Unknown or missing prediction site")
+    require(pred.ts.isin(times).all(), "Prediction timestamp outside the saved holdout")
+    require(len(pred) == len(sites) * len(times), "Incomplete holdout prediction grid")
+    require(np.isfinite(pred.forecast_kwh).all() and (pred.forecast_kwh >= 0).all(),
+            "Negative/non-finite holdout prediction")
+
+    gen = pd.read_parquet(root / "train/generation.parquet", columns=["site_id", "ts", "energy"])
+    gen["ts"] = timestamps(gen.ts)
+    gen = gen[gen.ts.between(first, last)].copy()
+    unique(gen, ["site_id", "ts"], "holdout generation")
+    require(gen.site_id.isin(sites.site_id).all(), "Unknown generation site")
+    arrays = evaluation_arrays(pred, gen, sites, prices)
+
+    def metrics(assignment):
+        result = score(arrays, assignment)
+        result.update(group_mae_kwh=None, group_rmse_kwh=None, wwape=None)
+        if arrays["complete_hours"]:
+            errors = np.column_stack([arrays["residual"][:, assignment == g].sum(axis=1) for g in [0, 1]])
+            denominator = float(np.dot(arrays["weights"], arrays["actual"].sum(axis=1)))
+            result.update(group_mae_kwh=float(np.abs(errors).mean()),
+                          group_rmse_kwh=float(np.sqrt(np.square(errors).mean())),
+                          wwape=weighted_error(arrays, assignment) / denominator if denominator > 0 else None)
+        return result
+
+    reference = metrics((sites.current_group == "B").to_numpy(np.int8))
+    selected = metrics(groups)
+    comparison = {"penalty_reduction_won": None, "penalty_reduction_pct": None}
+    if arrays["complete_hours"]:
+        reduction = reference["penalty_won"] - selected["penalty_won"]
+        comparison.update(penalty_reduction_won=reduction,
+                          penalty_reduction_pct=100 * reduction / reference["penalty_won"]
+                          if reference["penalty_won"] > 0 else None)
+    if arrays["coverage"] < 1:
+        warnings.append("Scores use only hours with valid actuals for every site; do not treat them as full-period revenue.")
+    if arrays["complete_hours"] == 0:
+        warnings.append("No complete actual hours: settlement and error metrics are unavailable, not zero.")
+    report_path = output / "validation_report.json"
+    if report_path.is_file():
+        previous = json.loads(report_path.read_text(encoding="utf-8"))
+        fallback = previous.get("group_search", {}).get("fallback")
+        if fallback:
+            warnings.append("Allocation search retained reference groups: " + fallback)
+    return {"evaluation": "local_chronological_holdout", "first_ts": str(first), "last_ts": str(last),
+            "capacity_kw": capacities, "holdout_reference": reference, "holdout_selected": selected,
+            "comparison": comparison, "warnings": warnings,
+            "note": "Earlier holdout model predictions, not final-model performance or an official leaderboard score."}
+
+
+def print_evaluation(report):
+    ref, selected = report["holdout_reference"], report["holdout_selected"]
+    print("Local chronological holdout (not official leaderboard)")
+    print(f"Period: {report['first_ts']} .. {report['last_ts']}")
+    print(f"Complete actual hours: {selected['complete_hours']:,}/{selected['total_hours']:,} "
+          f"({selected['coverage']:.2%})")
+    print(f"{'Metric':<28} {'Reference':>18} {'Selected':>18}")
+    for key, label in [("score_won", "S: settlement (KRW)"), ("penalty_won", "W: penalty (KRW)"),
+                       ("group_mae_kwh", "Group MAE (kWh)"), ("group_rmse_kwh", "Group RMSE (kWh)"),
+                       ("wwape", "Weighted WAPE")]:
+        values = ["N/A" if item.get(key) is None else
+                  (f"{item[key]:.2%}" if key == "wwape" else f"{item[key]:,.4f}") for item in [ref, selected]]
+        print(f"{label:<28} {values[0]:>18} {values[1]:>18}")
+    delta = report["comparison"]["penalty_reduction_won"]
+    print("Penalty reduction (positive = better): " + ("N/A" if delta is None else f"{delta:,.4f} KRW"))
+    for warning in report["warnings"]:
+        print("WARNING: " + warning)
+    print(report["note"])
+
+
 def predict_saved(root, model_dir, output, chunk_hours=168):
     """Reproduce inference without loading labels or retraining."""
-    import lightgbm as lgb
     root, model_dir, output = Path(root), Path(model_dir), Path(output)
     require(not output.exists() or not any(output.iterdir()), "Output directory must be empty")
     manifest = json.loads((model_dir / "manifest.json").read_text(encoding="utf-8"))
@@ -424,7 +517,12 @@ def predict_saved(root, model_dir, output, chunk_hours=168):
     require(comp.group.isin(["G1", "G2"]).all(), "Invalid saved group")
     groups = (comp.set_index("site_id").reindex(sites.site_id).group == "G2").to_numpy(np.int8)
     validate_groups(sites, groups)
-    model = lgb.Booster(model_file=str(model_dir / "model.txt"))
+    artifact = manifest.get("model_artifact")
+    if artifact is not None:
+        cls = backends.backend_class(artifact["backend"])
+        require(artifact["file"] == cls.filename, "Unexpected model artifact filename")
+        require(fingerprint(model_dir / cls.filename) == artifact["fingerprint"], "Saved model artifact changed")
+    model = backends.load_model(model_dir, manifest)
     predictions = predict_sites(model, sites, load_forecasts(root, "test"), times, chunk_hours)
     output.mkdir(parents=True, exist_ok=True)
     predictions.to_parquet(output / "site_predictions.parquet", index=False)
@@ -433,6 +531,8 @@ def predict_saved(root, model_dir, output, chunk_hours=168):
 
 def run_pipeline(root, output, config):
     root, output = Path(root), Path(output)
+    # Fail before expensive data preparation when an optional backend is absent.
+    backends.ensure_available(config.model)
     status = audit(root)
     require(not status["missing_files"], "Missing files:\n" + "\n".join(status["missing_files"]))
     require(not output.exists() or not any(output.iterdir()), "Output directory must be empty; choose a new directory")
@@ -501,10 +601,11 @@ def run_pipeline(root, output, config):
     final_train = training_matrix(gen, sites, weather, prices, start, cut_final)
     manifest["final_fit"] = final_train[3]
     final_model = fit_model(final_train, config, rounds=rounds)
-    final_model.booster_.save_model(str(output / "model.txt"))
-    pd.DataFrame({"feature": final_model.feature_name_,
-                  "gain": final_model.booster_.feature_importance(importance_type="gain")}).sort_values(
-                      "gain", ascending=False).to_csv(output / "feature_importance.csv", index=False)
+    manifest["model_artifact"] = final_model.save(output)
+    manifest["model_artifact"]["fingerprint"] = fingerprint(output / final_model.filename)
+    importance = final_model.importance()
+    if importance is not None:
+        importance.to_csv(output / "feature_importance.csv", index=False)
     del final_train, gen, weather
     gc.collect()
     log("4/5 Predict all scoring hours using both forecast rounds; write and validate submission")
@@ -515,11 +616,14 @@ def run_pipeline(root, output, config):
     log("5/5 Save audit trail, local validation scores and input hashes")
     manifest["input_files"] = {name: fingerprint(root / name) for name in REQUIRED}
     manifest["code"] = fingerprint(Path(__file__))
+    manifest["model_backend_code"] = fingerprint(Path(backends.__file__))
     manifest["python"] = sys.version
     manifest["packages"] = {name: importlib.metadata.version(name) for name in
-                            ["numpy", "pandas", "lightgbm", "pyarrow", "scikit-learn"]}
+                            sorted({"numpy", "pandas", "pyarrow", "scikit-learn", *final_model.packages})}
     manifest["features"] = final_model.feature_name_
     manifest["prohibited_inputs_used"] = []
+    manifest["holdout_artifacts"] = {name: fingerprint(output / name) for name in
+                                     ["composition.csv", "holdout_site_predictions.parquet"]}
     for name, value in [("manifest.json", manifest), ("validation_report.json", report)]:
         (output / name).write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
     log(json.dumps(report, ensure_ascii=False, indent=2))
@@ -529,17 +633,20 @@ def run_pipeline(root, output, config):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ["audit", "run", "validate", "predict"]:
+    for name in ["audit", "run", "validate", "predict", "evaluate"]:
         p = sub.add_parser(name)
         p.add_argument("--data", type=Path, default=Path("data"))
-        if name in ["run", "validate", "predict"]:
+        if name in ["run", "validate", "predict", "evaluate"]:
             p.add_argument("--output", type=Path, default=Path("outputs"))
+        if name == "evaluate":
+            p.add_argument("--report", type=Path, help="Write evaluation JSON to a new file (never overwrite)")
         if name == "predict":
             p.add_argument("--model-dir", type=Path, required=True)
             p.add_argument("--chunk-hours", type=int, default=168)
         if name == "run":
             for key, value in asdict(Config()).items():
-                p.add_argument("--" + key.replace("_", "-"), type=type(value), default=value)
+                options = {"choices": backends.MODEL_NAMES} if key == "model" else {}
+                p.add_argument("--" + key.replace("_", "-"), type=type(value), default=value, **options)
     args = parser.parse_args()
     try:
         if args.command == "audit":
@@ -552,13 +659,25 @@ def main():
         if args.command == "predict":
             print(json.dumps(predict_saved(args.data, args.model_dir, args.output, args.chunk_hours), indent=2))
             return 0
+        if args.command == "evaluate":
+            if args.report is not None:
+                require(not args.report.exists(), "Report already exists; choose a new filename")
+            result = evaluate_saved(args.data, args.output)
+            print_evaluation(result)
+            if args.report is not None:
+                args.report.parent.mkdir(parents=True, exist_ok=True)
+                with args.report.open("x", encoding="utf-8") as stream:
+                    json.dump(result, stream, ensure_ascii=False, indent=2, allow_nan=False)
+                print(f"Saved {args.report}")
+            return 0
         config = Config(**{key: getattr(args, key) for key in asdict(Config())})
-        for key in ["trees", "early_stopping", "num_leaves", "min_child_samples", "threads", "chunk_hours", "min_complete_hours"]:
+        for key in ["trees", "early_stopping", "num_leaves", "min_child_samples", "threads", "chunk_hours", "min_complete_hours", "max_depth"]:
             require(getattr(config, key) > 0, f"{key} must be positive")
+        require(np.isfinite(config.learning_rate) and config.learning_rate > 0, "learning_rate must be finite and positive")
         require(config.search_steps >= 0, "search_steps must be nonnegative")
         run_pipeline(args.data, args.output, config)
         return 0
-    except (ValueError, FileNotFoundError, KeyError) as error:
+    except (ValueError, FileNotFoundError, FileExistsError, KeyError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
 
